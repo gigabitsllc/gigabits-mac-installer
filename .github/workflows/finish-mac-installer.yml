@@ -1,0 +1,61 @@
+# Finishes a Mac installer that Apple was still reviewing when "Build Mac installer" ended.
+# It takes the signed installer from the last build, asks Apple for its approval and attaches it.
+# Run it from the Actions tab ("Run workflow"). If Apple is not done yet it fails in about a minute; try again later.
+# Uses the same repository secrets as the build: APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD.
+name: Finish Mac installer
+on: workflow_dispatch
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  finish:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get the signed installer from the last build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build-mac-installer.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then echo "::error::No finished 'Build Mac installer' run was found. Run that workflow first."; exit 1; fi
+          echo "Using build run $RUN_ID"
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name Gigabits-Setup --dir .
+          cat NOTARIZATION.txt || true
+
+      - name: Ask Apple and attach the approval
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          AUTH=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
+          echo "Recent submissions at Apple:"
+          xcrun notarytool history "${AUTH[@]}" | head -40 || true
+          ID=$(sed -n 's/^Apple submission ID: //p' NOTARIZATION.txt 2>/dev/null | head -1)
+          STATUS=""
+          if [ -n "$ID" ] && xcrun notarytool info "$ID" "${AUTH[@]}" --output-format plist > info.plist 2>/dev/null; then
+            STATUS=$(/usr/libexec/PlistBuddy -c "Print :status" info.plist 2>/dev/null || true)
+          fi
+          echo "Status of submission $ID: ${STATUS:-unknown}"
+          if [ "$STATUS" = "Invalid" ] || [ "$STATUS" = "Rejected" ]; then
+            echo "::error::Apple did not approve the installer (status: $STATUS). Apple's report follows."
+            xcrun notarytool log "$ID" "${AUTH[@]}" || true
+            exit 1
+          fi
+          if xcrun stapler staple Gigabits-Setup.pkg; then
+            spctl -a -vv -t install Gigabits-Setup.pkg
+            printf 'Apple submission ID: %s\nStatus: Accepted, approval attached\n' "$ID" > NOTARIZATION.txt
+            echo "::notice::Apple approved the installer. Download the Gigabits-Setup artifact from this run; it is ready to use."
+          else
+            echo "::error::Apple has not finished reviewing the installer yet. Run this workflow again later."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Gigabits-Setup
+          path: |
+            Gigabits-Setup.pkg
+            NOTARIZATION.txt

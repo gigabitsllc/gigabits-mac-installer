@@ -1,5 +1,6 @@
 # Builds, signs and notarizes the Gigabits Mac installer on a GitHub-hosted Mac.
 # Run it from the repository's Actions tab ("Run workflow"), then download the "Gigabits-Setup" artifact.
+# If the run ends with a yellow warning that Apple is still reviewing, run "Finish Mac installer" later.
 # Needs these repository secrets (Settings > Secrets and variables > Actions):
 #   DEVID_P12_BASE64, DEVID_P12_PASSWORD, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD
 name: Build Mac installer
@@ -8,6 +9,7 @@ on: workflow_dispatch
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 30   # a stuck run can no longer use up hours of build time
     steps:
       - uses: actions/checkout@v4
 
@@ -43,17 +45,45 @@ jobs:
             --identifier com.gigabitstech.protection-setup --version 1.0 \
             --sign "$IDENTITY" --keychain "$KEYCHAIN" Gigabits-Setup.pkg
 
+      # Sends the installer to Apple, then waits up to 15 minutes for the answer.
+      # Apple usually answers in minutes, but a first submission from a new account can take hours.
+      # If Apple is still working on it, this run finishes anyway and keeps the signed installer;
+      # run the "Finish Mac installer" workflow later to attach Apple's approval.
       - name: Notarize with Apple
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          xcrun notarytool submit Gigabits-Setup.pkg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
-          xcrun stapler staple Gigabits-Setup.pkg
-          spctl -a -vv -t install Gigabits-Setup.pkg
+          AUTH=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
+          xcrun notarytool submit Gigabits-Setup.pkg "${AUTH[@]}" --output-format plist > submit.plist
+          ID=$(/usr/libexec/PlistBuddy -c "Print :id" submit.plist)
+          echo "Apple submission ID: $ID"
+          STATUS="In Progress"
+          for i in $(seq 1 30); do
+            sleep 30
+            if xcrun notarytool info "$ID" "${AUTH[@]}" --output-format plist > info.plist 2>/dev/null; then
+              STATUS=$(/usr/libexec/PlistBuddy -c "Print :status" info.plist 2>/dev/null || echo "In Progress")
+            fi
+            echo "Check $i of 30: $STATUS"
+            if [ "$STATUS" != "In Progress" ]; then break; fi
+          done
+          printf 'Apple submission ID: %s\nStatus when this build finished: %s\n' "$ID" "$STATUS" > NOTARIZATION.txt
+          if [ "$STATUS" = "Accepted" ]; then
+            xcrun stapler staple Gigabits-Setup.pkg
+            spctl -a -vv -t install Gigabits-Setup.pkg
+            echo "::notice::Apple approved the installer. Download the Gigabits-Setup artifact; it is ready to use."
+          elif [ "$STATUS" = "In Progress" ]; then
+            echo "::warning::Apple is still reviewing the installer (submission $ID). Run the 'Finish Mac installer' workflow in a few hours."
+          else
+            echo "::error::Apple did not approve the installer (status: $STATUS). Apple's report follows."
+            xcrun notarytool log "$ID" "${AUTH[@]}" || true
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: Gigabits-Setup
-          path: Gigabits-Setup.pkg
+          path: |
+            Gigabits-Setup.pkg
+            NOTARIZATION.txt
