@@ -1,0 +1,45 @@
+#!/bin/bash
+# Gigabits Computer Protection Plan - Mac installer (runs as root inside the .pkg).
+# One signed package works for every customer: the enrollment code rides in the FILE NAME
+# (Gigabits-Setup-GB-XXXXXXXX.pkg). The package itself contains no customer data and no installer links;
+# it asks the Gigabits setup service for that customer's setup script and runs it.
+
+PKG_PATH="$1"
+SERVICE="https://gigabits-pc-health.round-shape-5e4e.workers.dev"
+LOG="/var/log/gigabits-setup.log"
+
+tell_user() { # best effort: show a message to the person at the screen
+  local uid
+  uid=$(stat -f%u /dev/console 2>/dev/null)
+  [ -n "$uid" ] && launchctl asuser "$uid" /usr/bin/osascript -e "display dialog \"$1\" with title \"Gigabits Protection Setup\" buttons {\"OK\"} default button 1" >/dev/null 2>&1
+}
+
+{
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) Gigabits setup from: $PKG_PATH"
+} >>"$LOG" 2>&1
+
+CODE=$(basename "$PKG_PATH" | tr '[:lower:]' '[:upper:]' | grep -oE 'GB-[0-9A-F]{8}' | head -1)
+if [ -z "$CODE" ]; then
+  echo "No enrollment code in the file name." >>"$LOG"
+  tell_user "This installer is missing your plan code. Please download it again from My account on the Gigabits website and run that file without renaming it."
+  exit 1
+fi
+
+SCRIPT="/tmp/gigabits-setup-$$.sh"
+if ! /usr/bin/curl -fsSL "$SERVICE/setup/mac/$CODE" -o "$SCRIPT" >>"$LOG" 2>&1; then
+  tell_user "Setup couldn't reach Gigabits. Please check your internet connection and run the installer again."
+  exit 1
+fi
+
+OUT=$(GB_BACKGROUND=1 /bin/bash "$SCRIPT" 2>&1)
+RC=$?
+echo "$OUT" >>"$LOG"
+rm -f "$SCRIPT"
+
+if [ "$RC" -ne 0 ]; then
+  # Show the setup service's own reason (plan full, code not active, and so on).
+  MSG=$(echo "$OUT" | sed 's/^ *//' | grep -v '^$' | grep -v 'Gigabits Computer Protection Plan setup' | head -3 | tr '\n' ' ' | sed 's/"/'"'"'/g')
+  tell_user "${MSG:-Setup could not finish. Please try again, or ask Gigabits AI Help in your member account.}"
+  exit 1
+fi
+exit 0
